@@ -814,6 +814,12 @@ class DroneAgent:
             if len(data) < 1:
                 continue
             hdr = data[0]
+            # The SITL socket link emits CRTP null packets continuously while
+            # idle. They are transport keepalives, not CFLib payload, and
+            # forwarding them fills the small passthrough queue fast enough
+            # to drop real platform/TOC responses during connection setup.
+            if (hdr & 0xF3) == 0xF3:
+                continue
             if hdr == CRTP_HDR_SIM and len(data) >= 9:
                 # Motor PWM packet (SIM port, channel 0)
                 m0, m1, m2, m3 = struct.unpack_from('<HHHH', data, 1)

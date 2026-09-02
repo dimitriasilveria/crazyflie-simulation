@@ -76,8 +76,14 @@ build_path=${src_path}/sitl_make/build
 crazysim_dir="$SCRIPT_DIR/.."
 spawn_list_dir="${src_path}/tools/crazyflie-simulation/drone_spawn_list"
 
-if [ ! -f "${spawn_list_dir}/${coordinates_file}" ]; then
-	echo "ERROR: Coordinates file not found: ${spawn_list_dir}/${coordinates_file}"
+if [[ "${coordinates_file}" = /* ]]; then
+	coordinates_path="${coordinates_file}"
+else
+	coordinates_path="${spawn_list_dir}/${coordinates_file}"
+fi
+
+if [ ! -f "${coordinates_path}" ]; then
+	echo "ERROR: Coordinates file not found: ${coordinates_path}"
 	echo "Available files:"
 	ls "${spawn_list_dir}/"
 	exit 1
@@ -105,7 +111,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 	popd &>/dev/null
 
 	n=$(($n + 1))
-done < "${spawn_list_dir}/${coordinates_file}"
+done < "${coordinates_path}"
 
 sleep 1
 
