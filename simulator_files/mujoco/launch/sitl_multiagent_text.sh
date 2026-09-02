@@ -3,6 +3,7 @@
 #
 # Usage: ./sitl_multiagent_text.sh [-m <model_type>] [-f <file_name>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]
 #        [--sensor-noise] [--ground-effect] [--downwash] [--flowdeck]
+#        [--limo-model <mjcf>] [--limo-pose-port <port>]
 #        [--wind-speed <m/s>] [--turbulence <level>]
 #
 # The coordinates file should have one X,Y pair per line (CSV format).
@@ -16,6 +17,7 @@ if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "Description: Launch multiple Crazyflie SITL agents from a coordinates file in MuJoCo."
 	echo "Usage: $0 [-m <model_type>] [-f <file_name>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]"
 	echo "          [--sensor-noise] [--ground-effect] [--downwash] [--flowdeck]"
+	echo "          [--limo-model <mjcf>] [--limo-pose-port <port>]"
 	echo "          [--wind-speed <m/s>] [--turbulence <level>]"
 	echo ""
 	echo "Model types: cf2x_T350 (default), cf2x_L250, cf2x_P250, cf21B_500"
@@ -31,6 +33,8 @@ if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "  --wind-direction <deg> Wind direction (0=+X, 90=+Y, 180=-X, 270=-Y)"
 	echo "  --gust-intensity <m/s> Random gust peak deviation"
 	echo "  --turbulence <level>  Dryden turbulence (none, light, moderate, severe)"
+	echo "  --limo-model <mjcf>   Add the ROS-controlled LIMO to the MuJoCo world"
+	echo "  --limo-pose-port <n>  UDP pose input port (default: 19849)"
 	exit 1
 fi
 
@@ -40,6 +44,8 @@ GROUND_EFFECT=""
 DOWNWASH=""
 FLOWDECK=""
 WIND_ARGS=""
+LIMO_MODEL=""
+LIMO_POSE_PORT="19849"
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -51,6 +57,8 @@ while [[ $# -gt 0 ]]; do
 		--wind-direction) WIND_ARGS="$WIND_ARGS --wind-direction $2"; shift 2;;
 		--gust-intensity) WIND_ARGS="$WIND_ARGS --gust-intensity $2"; shift 2;;
 		--turbulence)     WIND_ARGS="$WIND_ARGS --turbulence $2"; shift 2;;
+		--limo-model)     LIMO_MODEL="$2"; shift 2;;
+		--limo-pose-port) LIMO_POSE_PORT="$2"; shift 2;;
 		*) POSITIONAL+=("$1"); shift;;
 	esac
 done
@@ -123,6 +131,10 @@ mass_arg=""
 [ -n "${MASS}" ] && mass_arg="--mass ${MASS}"
 scene_arg=""
 [ -n "${SCENE}" ] && scene_arg="--scene ${SCENE}"
+limo_args=()
+if [ -n "${LIMO_MODEL}" ]; then
+	limo_args=(--limo-model "${LIMO_MODEL}" --limo-pose-port "${LIMO_POSE_PORT}")
+fi
 
 python3 "$crazysim_dir/crazysim.py" \
 	--model-type "${model_type}" \
@@ -136,4 +148,5 @@ python3 "$crazysim_dir/crazysim.py" \
 	${WIND_ARGS} \
 	${mass_arg} \
 	${scene_arg} \
+	"${limo_args[@]}" \
 	-- ${spawn_args}

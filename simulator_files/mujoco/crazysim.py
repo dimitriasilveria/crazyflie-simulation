@@ -112,6 +112,9 @@ TOF_RATE_HZ   = 40         # VL53L1x ToF update rate (flowdeck)
 FLOW_NPIX     = 30.0       # PMW3901 pixel count
 FLOW_THETAPIX = 4.2 * math.pi / 180.0  # FOV per pixel [rad]
 CFLIB_PORT_OFFSET = -100   # cflib port = firmware port + offset (19950 → 19850)
+LIMO_POSE_PORT = 19849
+LIMO_POSE_FORMAT = '<7d'   # x, y, z, qw, qx, qy, qz
+LIMO_POSE_SIZE = struct.calcsize(LIMO_POSE_FORMAT)
 
 # ---------------------------------------------------------------------------
 # Per-model motor parameters — loaded from drone-models submodule params.toml
@@ -569,8 +572,26 @@ def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
         light.active = False
 
 
+def _attach_limo_spec(scene_spec: mujoco.MjSpec,
+                      limo_xml: str | None) -> None:
+    """Attach the optional ROS-controlled LIMO mocap body to the world."""
+    if limo_xml is None:
+        return
+    if not os.path.isfile(limo_xml):
+        raise FileNotFoundError(f'LIMO MuJoCo model not found: {limo_xml}')
+
+    limo_spec = mujoco.MjSpec.from_file(limo_xml)
+    limo_body = limo_spec.body('LIMO')
+    if limo_body is None:
+        raise ValueError(
+            f'LIMO MuJoCo model must contain a body named "LIMO": {limo_xml}')
+    frame = scene_spec.worldbody.add_frame()
+    frame.attach_body(limo_body, 'limo_', '')
+
+
 def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]],
-                      params: MotorParams) -> mujoco.MjSpec:
+                      params: MotorParams,
+                      limo_xml: str | None = None) -> mujoco.MjSpec:
     """
     Combine scene.xml + N drone models using MjSpec.
     Each drone body is attached at a unique spawn position with a unique
@@ -588,17 +609,21 @@ def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]]
         attached = frame.attach_body(drone_spec.body('drone'), prefix, '')
         attached.add_freejoint()
 
+    _attach_limo_spec(scene_spec, limo_xml)
+
     return scene_spec
 
 
 def _build_spec_multi_safe(drone_xml: str, spawn_positions: list[tuple[float, float]],
-                           params: MotorParams) -> mujoco.MjModel:
+                           params: MotorParams,
+                           limo_xml: str | None = None) -> mujoco.MjModel:
     """
     Build multi-agent model. Falls back to mesh-stripped drone if STL assets
     are missing.
     """
     try:
-        return _build_spec_multi(drone_xml, spawn_positions, params).compile()
+        return _build_spec_multi(
+            drone_xml, spawn_positions, params, limo_xml).compile()
     except ValueError as exc:
         err = str(exc)
         if 'opening file' not in err and '.stl' not in err.lower():
@@ -618,6 +643,8 @@ def _build_spec_multi_safe(drone_xml: str, spawn_positions: list[tuple[float, fl
             prefix = f'cf{i}_'
             attached = frame.attach_body(drone_spec.body('drone'), prefix, '')
             attached.add_freejoint()
+
+        _attach_limo_spec(scene_spec, limo_xml)
 
         return scene_spec.compile()
 
@@ -1176,6 +1203,53 @@ class DroneAgent:
 
 
 # ---------------------------------------------------------------------------
+class LimoPoseReceiver:
+    """Apply ROS-generated LIMO poses to a MuJoCo mocap body over UDP."""
+
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
+                 host: str, port: int):
+        body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, 'limo_LIMO')
+        if body_id < 0:
+            raise ValueError('Attached LIMO model has no limo_LIMO body.')
+        self._mocap_id = int(model.body_mocapid[body_id])
+        if self._mocap_id < 0:
+            raise ValueError('The LIMO body must have mocap="true".')
+
+        self._data = data
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, port))
+        self._sock.setblocking(False)
+        print(f'[crazysim] LIMO poses : udp://{host}:{port}')
+
+    def update(self):
+        """Drain pending datagrams and apply the newest valid pose."""
+        newest = None
+        while True:
+            try:
+                packet, _ = self._sock.recvfrom(256)
+            except BlockingIOError:
+                break
+            except OSError:
+                return
+            if len(packet) == LIMO_POSE_SIZE:
+                newest = struct.unpack(LIMO_POSE_FORMAT, packet)
+
+        if newest is None:
+            return
+        x, y, z, qw, qx, qy, qz = newest
+        quaternion = np.array([qw, qx, qy, qz], dtype=np.float64)
+        norm = float(np.linalg.norm(quaternion))
+        if not np.isfinite(quaternion).all() or norm < 1.0e-12:
+            return
+        self._data.mocap_pos[self._mocap_id] = [x, y, z]
+        self._data.mocap_quat[self._mocap_id] = quaternion / norm
+
+    def stop(self):
+        self._sock.close()
+
+
 class CrazySimMuJoCo:
     """
     Multi-agent MuJoCo SITL simulator for Crazyflie firmware.
@@ -1197,7 +1271,9 @@ class CrazySimMuJoCo:
                  camera_enabled: bool = False,
                  cam_width: int = 324, cam_height: int = 244,
                  cam_fps: float = 20.0,
-                 cam_port: int | None = None):
+                 cam_port: int | None = None,
+                 limo_model: str | None = None,
+                 limo_pose_port: int = LIMO_POSE_PORT):
         self.host = host
         self.visualize = visualize
         self.dt = timestep
@@ -1235,9 +1311,13 @@ class CrazySimMuJoCo:
             print(f'[crazysim] features   : {", ".join(features)}')
 
         # Build shared MuJoCo model with all drones
-        self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
+        self.model = _build_spec_multi_safe(
+            model_path, spawn_positions, params, limo_model)
         self.model.opt.timestep = self.dt
         self.data = mujoco.MjData(self.model)
+        self._limo = LimoPoseReceiver(
+            self.model, self.data, host, limo_pose_port,
+        ) if limo_model is not None else None
 
         # Create per-drone agents
         self.agents: list[DroneAgent] = []
@@ -1314,6 +1394,8 @@ class CrazySimMuJoCo:
 
         def _step_and_send():
             """One physics step + CRTP packet dispatch for all agents."""
+            if self._limo is not None:
+                self._limo.update()
             for agent in self.agents:
                 agent.update_motors()
                 agent.apply_aero_effects()
@@ -1390,6 +1472,8 @@ class CrazySimMuJoCo:
         self._running = False
         for agent in self.agents:
             agent.stop()
+        if self._limo is not None:
+            self._limo.stop()
         print('[crazysim] Done.')
 
 
@@ -1457,6 +1541,10 @@ def main():
                    help='Override drone mass [kg]')
     p.add_argument('--scene', default=None,
                    help='Path to scene MJCF XML (default: scene.xml)')
+    p.add_argument('--limo-model', default=None,
+                   help='Optional LIMO MJCF model to attach to the shared world')
+    p.add_argument('--limo-pose-port', type=int, default=LIMO_POSE_PORT,
+                   help='UDP port for x,y,z,qw,qx,qy,qz LIMO poses')
     # --- Feature flags ---
     p.add_argument('--sensor-noise', action='store_true',
                    help='Enable sensor noise model (IMU + baro)')
@@ -1555,6 +1643,8 @@ def main():
         cam_height=args.cam_height,
         cam_fps=args.cam_fps,
         cam_port=args.cam_port,
+        limo_model=args.limo_model,
+        limo_pose_port=args.limo_pose_port,
     ).run()
 
 
